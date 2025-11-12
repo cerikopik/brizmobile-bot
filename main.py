@@ -1,64 +1,92 @@
 import os
 import asyncio
-from aiohttp import web
+import sqlite3
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Update, Message
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message, Update
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiohttp import web
 
+# Конфиг
 TOKEN = os.environ["TOKEN"]
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))
-LIST_CHAT_IDS = [x.strip() for x in os.environ.get("LIST_CHAT_IDS", "").split(",") if x.strip()]
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-@dp.message(F.text == "/start")
-async def on_start(msg: Message):
-    await msg.answer(f"Привет! Вы подписаны на обновления. Ваш chat_id: {msg.chat.id}")
+# FSM: состояния для рассылки
+class BroadcastStates(StatesGroup):
+    waiting_message = State()
 
-@dp.message(F.text.startswith("/broadcast "))
-async def broadcast_command(msg: Message):
+# --- Хранение chat_id всех пользователей ---
+def add_user(chat_id):
+    # Используем SQLite, БД будет храниться в файле users.db
+    conn = sqlite3.connect("users.db")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY)"
+    )
+    try:
+        conn.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect("users.db")
+    cur = conn.execute("SELECT chat_id FROM users")
+    ids = [row[0] for row in cur.fetchall()]
+    conn.close()
+    return ids
+
+# --- /start: каждый пользователь записывается в БД ---
+@dp.message(Command("start"))
+async def cmd_start(msg: Message):
+    add_user(msg.chat.id)
+    await msg.answer("Вы подписаны на рассылку обновлений!")
+
+# --- /broadcast: начинается процедура рассылки ---
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(msg: Message, state: FSMContext):
     if msg.chat.id != ADMIN_CHAT_ID:
-        await msg.answer("❌ У вас нет прав для рассылки.")
+        await msg.answer("❌ Нет прав на рассылку.")
         return
-    
-    text = msg.text.replace("/broadcast ", "", 1).strip()
-    
-    if not text:
-        await msg.answer("❌ Укажите текст сообщения после команды.\n\nПример:\n/broadcast Новая версия 1.2.0 доступна!")
+    await msg.answer("Введите текст рассылки и отправьте одним сообщением:")
+    await state.set_state(BroadcastStates.waiting_message)
+
+# --- Получаем текст рассылки только от администратора ---
+@dp.message(BroadcastStates.waiting_message)
+async def broadcast_text(msg: Message, state: FSMContext):
+    if msg.chat.id != ADMIN_CHAT_ID:
+        await msg.answer("❌ Только администратор может отправлять рассылку.")
         return
-    
-    status_msg = await msg.answer("📤 Рассылка началась...")
-    
-    sent = 0
-    failed = 0
+    text = msg.text.strip()
+    ids = get_all_users()
+    sent, failed = 0, 0
     failed_ids = []
-    
-    for cid in LIST_CHAT_IDS:
+
+    status_msg = await msg.answer(f"📤 Рассылка сообщения ({len(ids)} пользователей) началась...")
+
+    for cid in ids:
         try:
             await bot.send_message(cid, text)
             sent += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)  # антифлуд — 20 сообщений/сек
         except Exception as e:
             failed += 1
-            failed_ids.append(f"{cid} ({str(e)[:30]})")
-            print(f"Не удалось отправить в {cid}: {e}")
-    
-    report = f"✅ Рассылка завершена!\n\n"
-    report += f"📊 Статистика:\n"
-    report += f"• Успешно: {sent}\n"
-    report += f"• Ошибки: {failed}\n"
-    
-    if failed_ids:
-        report += f"\n❌ Не доставлено:\n"
-        for fid in failed_ids[:10]:
-            report += f"• {fid}\n"
-        if len(failed_ids) > 10:
-            report += f"... и ещё {len(failed_ids) - 10}"
-    
-    await status_msg.edit_text(report)
+            failed_ids.append(f"{cid} ({str(e)[:32]})")
 
+    report = f"✅ Рассылка завершена!\n\n• Всего: {len(ids)}\n• Доставлено: {sent}\n• Ошибки: {failed}\n"
+    if failed_ids:
+        report += "\n❌ Не доставлено:\n" + "\n".join(failed_ids[:10])
+        if len(failed_ids) > 10:
+            report += f"\n... и ещё {len(failed_ids) - 10}"
+
+    await status_msg.edit_text(report)
+    await state.clear()  # Сбросить FSM: для нового сообщения нужно снова /broadcast
+
+# --- Вебхук для Cloud Run ---
 async def handle_webhook(request: web.Request):
     data = await request.json()
     update = Update.model_validate(data)
@@ -71,5 +99,4 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    web.run_app(create_app(), host="0.0.0.0", port=port)
+    web.run_app(create_app(), host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
